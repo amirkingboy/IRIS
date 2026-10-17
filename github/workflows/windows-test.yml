@@ -1,26 +1,112 @@
 
-name: Windows Runner Test
+#requires -RunAsAdministrator
+$ErrorActionPreference = 'Stop'
 
-on:
-  workflow_dispatch:
+$HostName = 'minecraft-vps-rdp'
+$RdpUser = 'RDPAdmin'
+$TailscaleExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+$MsiPath = Join-Path $env:TEMP 'tailscale-setup-amd64.msi'
 
-jobs:
-  test:
-    runs-on: windows-latest
-    timeout-minutes: 10
+# Install Tailscale if needed
+if (-not (Test-Path $TailscaleExe)) {
+    Write-Host 'Downloading Tailscale...'
+    Invoke-WebRequest `
+        -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
+        -OutFile $MsiPath
 
-    steps:
-      - name: Show system information
-        shell: pwsh
-        run: |
-          Write-Host "=== Windows Runner ==="
-          Get-ComputerInfo |
-            Select-Object WindowsProductName, OsArchitecture
-          Write-Host "=== CPU ==="
-          Get-CimInstance Win32_Processor |
-            Select-Object Name, NumberOfCores
-          Write-Host "=== RAM ==="
-          Get-CimInstance Win32_ComputerSystem |
-            Select-Object @{N='RAM_GB';E={
-              [math]::Round($_.TotalPhysicalMemory / 1GB, 2)
-            }}
+    $p = Start-Process msiexec.exe `
+        -ArgumentList "/i `"$MsiPath`" /qn /norestart" `
+        -Wait -PassThru
+
+    if ($p.ExitCode -notin @(0, 3010)) {
+        throw "Tailscale installation failed: $($p.ExitCode)"
+    }
+}
+
+if (-not (Test-Path $TailscaleExe)) {
+    throw 'Tailscale was not installed successfully.'
+}
+
+# Create a password and local administrator account
+$Rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+try {
+    $bytes = New-Object byte[] 32
+    $Rng.GetBytes($bytes)
+    $Password = [Convert]::ToBase64String($bytes) + 'aA1!'
+}
+finally {
+    $Rng.Dispose()
+}
+
+$SecurePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+
+try {
+    $user = Get-LocalUser -Name $RdpUser -ErrorAction SilentlyContinue
+
+    if ($null -eq $user) {
+        New-LocalUser -Name $RdpUser -Password $SecurePassword `
+            -Description 'Private Tailscale RDP account' | Out-Null
+    } else {
+        Set-LocalUser -Name $RdpUser -Password $SecurePassword
+    }
+
+    $AdminGroup = Get-LocalGroup -SID 'S-1-5-32-544'
+    $member = Get-LocalGroupMember -Group $AdminGroup.Name |
+        Where-Object { $_.Name -match "\\$([regex]::Escape($RdpUser))$" }
+
+    if (-not $member) {
+        Add-LocalGroupMember -Group $AdminGroup.Name -Member $RdpUser
+    }
+
+    # Enable RDP and retain Network Level Authentication
+    $TSPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+    $RdpPath = "$TSPath\WinStations\RDP-Tcp"
+
+    Set-ItemProperty -Path $TSPath -Name fDenyTSConnections -Value 0
+    Set-ItemProperty -Path $RdpPath -Name UserAuthentication -Value 1
+
+    Set-Service -Name TermService -StartupType Automatic
+    Start-Service -Name TermService
+
+    # Permit RDP only from Tailscale IPv4 addresses
+    Get-NetFirewallRule -DisplayName 'RDP TCP from Tailscale only' `
+        -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+
+    New-NetFirewallRule -DisplayName 'RDP TCP from Tailscale only' `
+        -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 `
+        -RemoteAddress '100.64.0.0/10' -Profile Any | Out-Null
+
+    # Connect Tailscale using a securely entered key
+    $SecureKey = Read-Host 'Enter Tailscale auth key' -AsSecureString
+    $ptr = [IntPtr]::Zero
+
+    try {
+        $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureKey)
+        $AuthKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
+
+        & $TailscaleExe up "--auth-key=$AuthKey" "--hostname=$HostName"
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Tailscale connection failed.'
+        }
+    }
+    finally {
+        if ($ptr -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
+        }
+        if ($SecureKey) { $SecureKey.Dispose() }
+        Remove-Variable AuthKey -ErrorAction SilentlyContinue
+    }
+
+    Start-Sleep -Seconds 3
+    $TailscaleIP = & $TailscaleExe ip -4 |
+        Select-Object -First 1
+
+    Write-Host "Tailscale IPv4: $TailscaleIP"
+    Write-Host "Username: .\$RdpUser"
+    Write-Host "Generated password: $Password"
+    Write-Host 'Save the password securely.'
+}
+finally {
+    Remove-Variable Password -ErrorAction SilentlyContinue
+    $SecurePassword.Dispose()
+}
