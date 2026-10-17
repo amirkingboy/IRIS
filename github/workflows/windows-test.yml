@@ -1,0 +1,26 @@
+
+name: Windows Runner Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Show system information
+        shell: pwsh
+        run: |
+          Write-Host "=== Windows Runner ==="
+          Get-ComputerInfo |
+            Select-Object WindowsProductName, OsArchitecture
+          Write-Host "=== CPU ==="
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores
+          Write-Host "=== RAM ==="
+          Get-CimInstance Win32_ComputerSystem |
+            Select-Object @{N='RAM_GB';E={
+              [math]::Round($_.TotalPhysicalMemory / 1GB, 2)
+            }}
